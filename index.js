@@ -90,7 +90,7 @@ const Confirmation = {
     EMPTY_FAIL: 0x11
 };
 
-// TODO: Move in function sendPacket?
+// TODO: Move to sendPacket function?
 let receivedPacket = Buffer.from([]);
 let onDataReceive = () => {};
 let fingerLibrarySize = 0;
@@ -186,12 +186,54 @@ function warn(...args) {
 }
 
 function Package(identifier, length, instruction, ...payload) {
-    return {
-        identifier,
-        length,
-        instruction,
-        payload
-    };
+    receivedPacket = Buffer.from([]);
+
+    const packet = [];	
+
+    if (Object.values(Identifier).indexOf(identifier) < 0) {
+        throw `Package identifier: ${identifier} is invalid`;
+    }
+
+    if (Object.values(Instruction).indexOf(instruction) < 0) {
+        throw `Instruction code: ${instruction} is invalid`;
+    }
+
+    packet.push(Fingerprint.HEADER >> 8);
+    packet.push(Fingerprint.HEADER);
+    packet.push(Fingerprint.MODULE_ADDRESS >> 24);
+    packet.push(Fingerprint.MODULE_ADDRESS >> 16);
+    packet.push(Fingerprint.MODULE_ADDRESS >> 8);
+    packet.push(Fingerprint.MODULE_ADDRESS);
+    packet.push(identifier);
+    packet.push(length >> 8);
+    packet.push(length);
+    packet.push(instruction);
+
+    let checksum = identifier + length + instruction;
+
+    for (let i = 0; i < payload.length; ++i) {
+        if (Array.isArray(payload[i])) {
+            for (let j = 0; j < payload[i].length; ++j) {
+                packet.push(payload[i][j]);
+                checksum += payload[i][j];
+            }
+        }
+        else {
+            packet.push(payload[i]);
+            checksum += payload[i];
+        }
+    }
+
+    packet.push(checksum >> 8);
+    packet.push(checksum);
+
+    debug('Checksum: ', checksum);
+
+    const package = Buffer.from(packet);
+
+    debug('Package: ', package);
+
+    return package;
 }
 
 function verifyPassword(password = Fingerprint.DEFAULT_PASSWORD) {
@@ -899,7 +941,7 @@ function handshake() {
     });
 }
 
-function receivePacket(expectedPacketLength, callback) {
+function receivePacket(expectedPacketLength, callbackSuccess, callbackError) {
     onDataReceive = data => {
         debug('...');
 
@@ -930,75 +972,27 @@ function receivePacket(expectedPacketLength, callback) {
 
         if (receivedChecksum !== packageChecksum.readUInt16BE()) {
             debug(receivedChecksum, packageChecksum.readUInt16BE());
-            throw 'Checksums does not match';
+            callbackError('Checksums does not match');
         }
         else if (packetLength != expectedPacketLength) {
             debug(expectedPacketLength, packetLength);
-            throw 'Incomplete data packet received';
+            callbackError('Incomplete data packet received');
         }
+        else {
+            debug('Confirmation Code: ', confirmationCode);
 
-        debug('Confirmation Code: ', confirmationCode);
-
-        callback({
-            confirmationCode, 
-            payload
-        });
+            callbackSuccess({
+                confirmationCode, 
+                payload
+            });
+        }
     };
 }
 
 function sendPacket(package, expectedPacketLength) {
-    debug('Package: ', package);
-    receivedPacket = Buffer.from([]);
+    debug('Send packet: ', package);
 
-    const packet = [];	
-    const packageIdentifier = package.identifier;
-    const packageLength = package.length;
-    const instructionCode = package.instruction; 
-    const payload = package.payload;
-
-    if (Object.values(Identifier).indexOf(packageIdentifier) < 0) {
-        throw `Package identifier: ${packageIdentifier} is invalid`;
-    }
-
-    if (Object.values(Instruction).indexOf(instructionCode) < 0) {
-        throw `Instruction code: ${instructionCode} is invalid`;
-    }
-
-    packet.push(Fingerprint.HEADER >> 8);
-    packet.push(Fingerprint.HEADER);
-    packet.push(Fingerprint.MODULE_ADDRESS >> 24);
-    packet.push(Fingerprint.MODULE_ADDRESS >> 16);
-    packet.push(Fingerprint.MODULE_ADDRESS >> 8);
-    packet.push(Fingerprint.MODULE_ADDRESS);
-    packet.push(packageIdentifier);
-    packet.push(packageLength >> 8);
-    packet.push(packageLength);
-    packet.push(instructionCode);
-
-    let checksum = packageIdentifier + packageLength + instructionCode;
-
-    for (let i = 0; i < payload.length; ++i) {
-        if (Array.isArray(payload[i])) {
-            for (let j = 0; j < payload[i].length; ++j) {
-                packet.push(payload[i][j]);
-                checksum += payload[i][j];
-            }
-        }
-        else {
-            packet.push(payload[i]);
-            checksum += payload[i];
-        }
-    }
-
-    packet.push(checksum >> 8);
-    packet.push(checksum);
-
-    debug('Checksum: ', checksum);
-
-    const buffer = Buffer.from(packet);
-
-    debug('Send packet: ', buffer);
-    port.write(buffer, error => {
+    port.write(package, error => {
         if (error) {
             debug('Error on write: ', error.message);
         }
@@ -1010,11 +1004,12 @@ function sendPacket(package, expectedPacketLength) {
         port.drain(error => {
             if (error) {
                 debug('Error on drain: ', error);
+                reject(error);
             }
 
             debug('Port drained');
 
-            receivePacket(expectedPacketLength, resolve);
+            receivePacket(expectedPacketLength, resolve, reject);
         });
     });
 }
