@@ -130,17 +130,17 @@ port.on('data', data => {
 function verifyParameter(parameter, value) {
     switch (parameter) {
         case Parameter.BAUD_RATE_CONTROL:
-            if (!(value >= 1 && value <= 12)) {
+            if (value < 1 || value > 12) {
                 throw 'Baud rate control must be between 1 and 12 inclusive';
             }
             break;
         case Parameter.SECURITY_LEVEL:
-            if (!(value >= 1 && value <= 5)) {
+            if (value < 1 || value > 5) {
                 throw 'Security level must be between 1 and 5 inclusive';
             }
             break;
         case Parameter.DATA_PACKAGE_LENGTH:
-            if (!(value >= 0 && value <= 3)) {
+            if (value < 0 || value > 3) {
                 throw 'Data package length must be between 0 and 3 inclusive';
             }
             break;
