@@ -3,7 +3,7 @@
  * Buffer arguments.
  * Argument byte split.
  * Debug/verbose level? -v, -vv, -vvv
- * Use debug on confirmation verbose
+ * Append debug message to return data.
  */
 const SerialPort = require('serialport');
 
@@ -15,7 +15,7 @@ const DEBUG = args.indexOf('--debug') >= 0;
 const Fingerprint = {
     HEADER: 0xEF01,
     MODULE_ADDRESS: 0xFFFFFFFF,
-    DEFAULT_PASSWORD: 0xFFFFFFFF
+    DEFAULT_PASSWORD: 0x00000000 // 0xFFFFFFFF
 };
 const Identifier = {
     COMMAND_PACKET: 0x01,
@@ -54,8 +54,6 @@ const Instruction = {
     UPLOAD_IMAGE: 0x0A,
     DOWNLOAD_IMAGE: 0x0B,
     GENERATE_CHARACTER_FILE: 0x02,
-    GENERATE_TEMPLATE: 0x05,
-    UPLOAD_CHARACTER_FILE: 0x08,
     DOWNLOAD_TEMPLATE: 0x09,
     STORE_TEMPLATE: 0x06,
     READ_TEMPLATE: 0x07,
@@ -87,13 +85,12 @@ const Confirmation = {
     DATA_PACKET_TRANSFER_FAIL: 0x0E,
     ADDRESSING_PAGE_ID_BEYOND_LIBRARY: 0x0B,
     DELETE_TEMPLATE_FAIL: 0x10,
-    EMPTY_FAIL: 0x11
+    EMPTY_FAIL: 0x11,
+    NOT_MATCH: 0x08
 };
 
 // TODO: Move to sendPacket function?
-let receivedPacket = Buffer.from([]);
 let onDataReceive = () => {};
-let fingerLibrarySize = 0;
 
 port.on('open', error => {
     if (error) {
@@ -161,14 +158,81 @@ function verifyCharacterBuffer(characterBuffer) {
     }
 }
 
+async function enroll() {
+    let fingerFound = false;
+
+    log('Waiting for finger...');
+
+    while (!fingerFound) {
+        const { confirmationCode } = await generateImage();
+
+        fingerFound = confirmationCode === Confirmation.FINGER_DETECTED;
+    }
+
+    await generateCharacterFromImage(CharacterBuffer.ONE);
+
+    const result = await search(CharacterBuffer.ONE);
+
+    if (result.confirmationCode === Confirmation.SEARCH_FOUND) {
+        log('Found matching fingerprint');
+        log('Position: ', result.pageId);
+        log('Match Score: ', result.matchScore);
+        process.exit();
+    }
+    else if (result.confirmationCode === Confirmation.SEARCH_NOT_FOUND) {
+        log('Fingerprint no match');
+    }
+    else  {
+        log(result);
+    }
+
+    log('Remove finger');
+
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    log('Place same finger again...');
+
+    fingerFound = false;
+
+    while (!fingerFound) {
+        const { confirmationCode } = await generateImage();
+
+        fingerFound = confirmationCode === Confirmation.FINGER_DETECTED;
+    }
+
+    await generateCharacterFromImage(CharacterBuffer.TWO);
+
+    const matchResult = await checkMatch();
+
+    if (matchResult.confirmationCode === Confirmation.SUCCESS) {
+        await generateTemplate();
+
+        const { pageId } = await storeTemplate();
+
+        log('Finger enrolled');
+        log('PageId: ', pageId);
+        log('Template number: ', (await getTemplateNumber()).templateNumber);
+
+        return true;
+    }
+    else if (matchResult.confirmationCode === Confirmation.NOT_MATCH) {
+        log('Fingers does not match');
+        log('Please try again');
+    }
+
+    return false;
+}
+
 function execute() {
-    handshake().then(data => {
-        if (data.confirmationCode === Confirmation.SUCCESS) {
-            readSystemParameters().then(data => {
-                fingerLibrarySize = data.payload[4] << 8 | data.payload[5];
-            });
-        }
+    verifyPassword().then(async () => {
+        // log('Template number: ', (await getTemplateNumber()).templateNumber);
+        while (!(await enroll()));
     });
+    // handshake().then(data => {
+    //     if (data.confirmationCode === Confirmation.SUCCESS) {
+    //     }
+    //     return data;
+    // });
 }
 
 function debug(...args) {
@@ -178,7 +242,7 @@ function debug(...args) {
 }
 
 function log(...args) {
-    console.log(...args);
+    console.log('[USER]: ', ...args);
 }
 
 function warn(...args) {
@@ -210,6 +274,8 @@ function Package(identifier, length, instruction, ...payload) {
     packet.push(instruction);
 
     let checksum = identifier + length + instruction;
+
+    debug('Payload: ', payload);
 
     for (let i = 0; i < payload.length; ++i) {
         if (Array.isArray(payload[i])) {
@@ -243,7 +309,7 @@ function verifyPassword(password = Fingerprint.DEFAULT_PASSWORD) {
         Identifier.COMMAND_PACKET,
         0x07,
         Instruction.VERIFY_PASSWORD,
-        password
+        [ password >> 24, password >> 16, password >> 8, password & 0xFF ]
     ), 12).then(data => {
         switch (data.confirmationCode) {
             case Confirmation.SUCCESS:
@@ -434,8 +500,8 @@ function autoSearch(captureTime, startBitNumber, quantity) {
         0x0008,
         Instruction.AUTO_SEARCH,
         captureTime,
-        [ startBitNumber >> 8, startBitNumber ],
-        [ quantity >> 8, quantity ]
+        [ startBitNumber >> 8, startBitNumber & 0xFF ],
+        [ quantity >> 8, quantity & 0xFF ]
     ), 16).then(data => {
         const confirmationCode = data.confirmationCode;
         const pageId = data.payload[0] << 8 | data.payload[1];
@@ -516,14 +582,12 @@ function generateImage() {
         switch (data.confirmationCode) {
             case Confirmation.FINGER_DETECTED:
                 debug('Finger collection success');
-                callback();
                 break;
             case Confirmation.ERROR:
                 debug('Error when receiving package');
                 break;
             case Confirmation.FINGER_UNDETECTED:
-                debug('Can\t detect finger');
-                generateImage();
+                debug('Can\'t detect finger');
                 break;
             case Confirmation.FINGER_COLLECTION_FAILED:
                 debug('Fail to collect finger');
@@ -690,18 +754,23 @@ function downloadTemplate(characterBuffer) {
     });
 }
 
-function storeTemplate(characterBuffer = CharacterBuffer.ONE, pageId = 0x0000) {
+async function storeTemplate(characterBuffer = CharacterBuffer.ONE, pageId = -1) {
     debug('Store Template');
     verifyCharacterBuffer(characterBuffer);
+
+    const position = pageId > 0 ? pageId : (await getTemplateNumber()).templateNumber;
 
     return sendPacket(new Package(
         Identifier.COMMAND_PACKET,
         0x0006,
         Instruction.STORE_TEMPLATE,
         characterBuffer,
-        [ pageId >> 8, pageId ]
+        [ position >> 8, position & 0xFF ]
     ), 12).then(data => {
-        switch (data.confirmationCode) {
+        const confirmationCode = data.confirmationCode;
+        const pageId = position;
+
+        switch (confirmationCode) {
             case Confirmation.SUCCESS:
                 log('Storage success');
                 break;
@@ -716,7 +785,10 @@ function storeTemplate(characterBuffer = CharacterBuffer.ONE, pageId = 0x0000) {
                 break;
         }
 
-        return data;
+        return {
+            confirmationCode,
+            pageId
+        };
     });
 }
 
@@ -729,7 +801,7 @@ function readTemplate(characterBuffer, pageId) {
         0x0006,
         Instruction.READ_TEMPLATE,
         characterBuffer,
-        [ pageId >> 8, pageId ],
+        [ pageId >> 8, pageId & 0xFF ],
     ), 12).then(data => {
         switch (data.confirmationCode) {
             case Confirmation.SUCCESS:
@@ -757,8 +829,8 @@ function deleteTemplate(pageId, quantity) {
         Identifier.COMMAND_PACKET,
         0x0007,
         Instruction.DELETE_TEMPLATE,
-        [ pageId >> 8, pageId ],
-        [ quantity >> 8, quantity ]
+        [ pageId >> 8, pageId & 0xFF ],
+        [ quantity >> 8, quantity & 0xFF ]
     ), 12).then(data => {
         switch (data.confirmationCode) {
             case Confirmation.SUCCESS:
@@ -819,7 +891,7 @@ function checkMatch() {
                 debug('Error when receiving package');
                 break;
             case Confirmation.NOT_MATCH:
-                debug('Templates of the two buffers aren\t matching');
+                debug('Templates of the two buffers aren\'t matching');
                 break;
         }
 
@@ -830,17 +902,19 @@ function checkMatch() {
     })
 }
 
-function search(characterBuffer, startPageId = 0x0000, fingerLibrarySize) {
+async function search(characterBuffer, startPageId = 0x0000, count = -1) {
     debug('Search');
     verifyCharacterBuffer(characterBuffer);
+
+    let templateCount = count > 0 ? count : (await readSystemParameters()).fingerLibrarySize;
 
     return sendPacket(new Package(
         Identifier.COMMAND_PACKET,
         0x0008,
         Instruction.SEARCH,
         characterBuffer,
-        [ startPage >> 8, startPage ],
-        [ fingerLibrarySize >> 8, fingerLibrarySize ],
+        [ startPageId >> 8, startPageId & 0xFF ],
+        [ templateCount >> 8, templateCount & 0xFF ],
     ), 16).then(data => {
         const confirmationCode = data.confirmationCode;
         const pageId = data.payload[0] << 8 | data.payload[1];
@@ -848,13 +922,13 @@ function search(characterBuffer, startPageId = 0x0000, fingerLibrarySize) {
 
         switch (confirmationCode) {
             case Confirmation.SEARCH_FOUND:
-                log('Found the matching finger');
+                debug('Found the matching finger');
                 break;
             case Confirmation.ERROR:
-                log('Error when receiving package');
+                debug('Error when receiving package');
                 break;
             case Confirmation.SEARCH_NOT_FOUND:
-                log('No match in the library (both the PageID and match score are 0)');
+                debug('No match in the library (both the PageID and match score are 0)');
                 break;
         }
     
@@ -942,6 +1016,8 @@ function handshake() {
 }
 
 function receivePacket(expectedPacketLength, callbackSuccess, callbackError) {
+    let receivedPacket = Buffer.from([]);
+
     onDataReceive = data => {
         debug('...');
 
@@ -982,8 +1058,10 @@ function receivePacket(expectedPacketLength, callbackSuccess, callbackError) {
             debug('Confirmation Code: ', confirmationCode);
 
             callbackSuccess({
+                packageIdentifier,
                 confirmationCode, 
-                payload
+                payload,
+                packageChecksum
             });
         }
     };
@@ -992,19 +1070,19 @@ function receivePacket(expectedPacketLength, callbackSuccess, callbackError) {
 function sendPacket(package, expectedPacketLength) {
     debug('Send packet: ', package);
 
-    port.write(package, error => {
-        if (error) {
-            debug('Error on write: ', error.message);
-        }
-
-        debug('Message sent');
-    });
-
     return new Promise((resolve, reject) => {
+        port.write(package, error => {
+            if (error) {
+                debug('Error on write: ', error.message);
+            }
+
+            debug('Message sent');
+        });
+
         port.drain(error => {
             if (error) {
                 debug('Error on drain: ', error);
-                reject(error);
+                throw error;
             }
 
             debug('Port drained');
