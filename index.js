@@ -9,18 +9,6 @@ const SerialPort = require('serialport');
  * Test memory usage.
  */
 
-function logDebug(...args) {
-    console.log('[DEBUG]: ', ...args);
-}
-
-function log(...args) {
-    console.log('[USER]: ', ...args);
-}
-
-function logWarn(...args) {
-    console.log('[WARNING]: ', ...args);
-}
-
 const Package = function(identifier, length, instruction, ...payload) {
     const debug = (...args) => {
         if (this.showDebug) {
@@ -159,6 +147,19 @@ const Confirmation = {
     NOT_MATCH: 0x08
 };
 
+
+function logDebug(...args) {
+    console.log('[DEBUG]: ', ...args);
+}
+
+function log(...args) {
+    console.log('[USER]: ', ...args);
+}
+
+function logWarn(...args) {
+    console.log('[WARNING]: ', ...args);
+}
+
 const Zfm = function(path = '/dev/ttyUSB0', baudRate = 57600, showDebug = false) {
     const port = new SerialPort(path, {
         baudRate
@@ -170,10 +171,9 @@ const Zfm = function(path = '/dev/ttyUSB0', baudRate = 57600, showDebug = false)
         }
     };
 
-    // TODO: Move to sendPacket function?
-    let receivedPacket = Buffer.from([]);
     let onDataReceive = () => {};
-    let onOpen = () => {};
+
+    // TODO: onOpen, onClose, onError & onData?
     let events = {};
 
     this.on = (eventName, callback) => {
@@ -184,13 +184,13 @@ const Zfm = function(path = '/dev/ttyUSB0', baudRate = 57600, showDebug = false)
         events[eventName] && events[eventName](args);
     };
 
-    port.on('open', error => {
+    port.on('open', async (error) => {
         if (error) {
             debug('Error opening port: ', error.message);
         }
 
         debug('Port opened');
-        emitEvent('open', error);
+        emitEvent('open', await this.verifyPassword());
     });
 
     port.on('close', error => {
@@ -207,17 +207,17 @@ const Zfm = function(path = '/dev/ttyUSB0', baudRate = 57600, showDebug = false)
         emitEvent('error', error);
     });
 
-    port.on('data', data => {
-        debug('Data: ', data);
-        onDataReceive(data);
-        emitEvent('data', data);
-    });
-
-    // port.on('readable', () => {
-    //     debug('Data readable');
-    //     onDataReceive();
+    // port.on('data', data => {
+    //     debug('Data: ', data);
+    //     onDataReceive(data);
+    //     emitEvent('data', data);
     // });
 
+    port.on('readable', () => {
+        debug('Data readable');
+        onDataReceive();
+        emitEvent('readable');
+    });
 
     this.open = (callback) => {
         port.open(callback);
@@ -242,8 +242,8 @@ const Zfm = function(path = '/dev/ttyUSB0', baudRate = 57600, showDebug = false)
             const confirmationCode = data.confirmationCode;
             const templates = [];
 
-            for (let i = 0; i < data.packageLength; ++i) {
-                for (let bit = 0; bit < 4; ++bit) {
+            for (let i = 0; i < data.payload.length; ++i) {
+                for (let bit = 0; bit < 8; ++bit) {
                     templates.push((data.payload[i] & 2**bit) !== 0);
                 }
             }
@@ -296,76 +296,7 @@ const Zfm = function(path = '/dev/ttyUSB0', baudRate = 57600, showDebug = false)
         if (Object.values(CharacterBuffer).indexOf(characterBuffer) === -1) {
             throw 'Invalid character buffer';
         }
-    }
-
-    this.enroll = async () => {
-        let fingerFound = false;
-
-        log('Waiting for finger...');
-
-        while (!fingerFound) {
-            const { confirmationCode } = await this.generateImage();
-
-            fingerFound = confirmationCode === Confirmation.FINGER_DETECTED;
-        }
-
-        await this.generateCharacterFromImage(CharacterBuffer.ONE);
-
-        const result = await this.search(CharacterBuffer.ONE);
-
-        if (result.confirmationCode === Confirmation.SEARCH_FOUND) {
-            log('Finger already enrolled');
-
-            log('Position: ', result.pageId);
-            log('Match Score: ', result.matchScore);
-
-            log('Please place new finger...');
-
-            return await this.enroll();
-        }
-        else if (result.confirmationCode === Confirmation.SEARCH_NOT_FOUND) {
-            log('Fingerprint no match');
-        }
-        else  {
-            log(result);
-        }
-
-        log('Remove finger');
-
-        await new Promise(resolve => setTimeout(resolve, 2000));
-
-        log('Place same finger again...');
-
-        fingerFound = false;
-
-        while (!fingerFound) {
-            const { confirmationCode } = await this.generateImage();
-
-            fingerFound = confirmationCode === Confirmation.FINGER_DETECTED;
-        }
-
-        await this.generateCharacterFromImage(CharacterBuffer.TWO);
-
-        const matchResult = await this.checkMatch();
-
-        if (matchResult.confirmationCode === Confirmation.SUCCESS) {
-            await this.generateTemplate();
-
-            const { pageId } = await this.storeTemplate();
-
-            log('Finger enrolled');
-            log('PageId: ', pageId);
-            log('Template number: ', (await this.getTemplateNumber()).templateNumber);
-
-            return true;
-        }
-        else if (matchResult.confirmationCode === Confirmation.NOT_MATCH) {
-            log('Fingers does not match');
-            log('Please try again');
-        }
-
-        return false;
-    }
+    };
 
     this.verifyPassword = (password = Fingerprint.DEFAULT_PASSWORD) => {
         debug('Verify Password');
@@ -533,8 +464,8 @@ const Zfm = function(path = '/dev/ttyUSB0', baudRate = 57600, showDebug = false)
         });
     }
 
-    this.getTemplateNumber = () => {
-        debug('Template Number');
+    this.getTemplateCount = () => {
+        debug('Template Count');
 
         return this.sendPacket(new Package(
             Identifier.COMMAND_PACKET,
@@ -552,7 +483,7 @@ const Zfm = function(path = '/dev/ttyUSB0', baudRate = 57600, showDebug = false)
 
             return {
                 confirmationCode: data.confirmationCode,
-                templateNumber: data.payload[0] << 8 | data.payload[1]
+                value: data.payload[0] << 8 | data.payload[1]
             };
         });
     }
@@ -986,7 +917,7 @@ const Zfm = function(path = '/dev/ttyUSB0', baudRate = 57600, showDebug = false)
         })
     }
 
-    this.search = async (characterBuffer, startPageId = 0x0000, count = -1) => {
+    this.searchTemplate = async (characterBuffer, startPageId = 0x0000, count = -1) => {
         debug('Search');
         this.verifyCharacterBuffer(characterBuffer);
 
@@ -1100,14 +1031,16 @@ const Zfm = function(path = '/dev/ttyUSB0', baudRate = 57600, showDebug = false)
     }
 
     this.receivePacket = (expectedPacketLength, callbackSuccess, callbackError)  => {
-        receivedPacket = Buffer.from([]);
-
         onDataReceive = data => {
             debug('...');
 
             // TODO: Check start code.
 
-            receivedPacket = Buffer.concat([receivedPacket, data]);
+            const receivedPacket = port.read(expectedPacketLength);
+
+            if (receivedPacket === null) {
+                return;
+            }
 
             const packetLength = receivedPacket.length;
 
@@ -1178,6 +1111,81 @@ const Zfm = function(path = '/dev/ttyUSB0', baudRate = 57600, showDebug = false)
             });
         });
     }
+
+    this.wait = (seconds) => {
+        return new Promise(resolve => setTimeout(resolve, seconds * 1000));
+    };
+
+    this.scanFinger = async () => {
+        fingerFound = false;
+
+        log('Waiting for finger...');
+
+        while (!fingerFound) {
+            const { confirmationCode } = await this.generateImage();
+
+            fingerFound = confirmationCode === Confirmation.FINGER_DETECTED;
+        }
+
+    };
+
+    this.enroll = async () => {
+        const searchFound = await this.search(); 
+
+        if (searchFound) {
+            log('Finger already enrolled');
+            log('Please place new finger...');
+
+            return await this.enroll();
+        }
+
+        log('Remove finger');
+
+        await this.wait(2);
+
+        log('Place same finger again...');
+
+        await this.scanFinger();
+        await this.generateCharacterFromImage(CharacterBuffer.TWO);
+
+        const matchResult = await this.checkMatch();
+
+        if (matchResult.confirmationCode === Confirmation.SUCCESS) {
+            await this.generateTemplate();
+
+            const { pageId } = await this.storeTemplate();
+
+            log('Finger enrolled');
+            log('PageId: ', pageId);
+            log('Template count: ', (await this.getTemplateCount()).value);
+
+            return true;
+        }
+
+        log('Fingers does not match');
+
+        return false;
+    };
+
+    this.search = async () => {
+        await this.scanFinger();
+        await this.generateCharacterFromImage(CharacterBuffer.ONE);
+
+        const result = await this.searchTemplate(CharacterBuffer.ONE);
+
+        log('Position: ', result.pageId);
+        log('Match score: ', result.matchScore);
+
+        return result.confirmationCode === Confirmation.SEARCH_FOUND;
+    };
+
+    this.listPages = async (page) => {
+        const templates = (await this.getTemplateIndex(page)).templates;
+
+        for (let i = 0; i < templates.length; ++i) {
+            console.log(`Position ${page * templates.length + i}: `, templates[i] ? 'Used' : 'Unused');
+        }
+    };
 }
 
 module.exports = { 
